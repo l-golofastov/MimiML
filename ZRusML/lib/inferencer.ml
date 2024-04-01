@@ -1,10 +1,11 @@
-(** Copyright 2023-2024, Rustam Shangareev and Danil Yevdokimov*)
+(** Copyright 2023-2024, Rustam Shangareev and Danil Yevdokimov *)
 
 (** SPDX-License-Identifier: LGPL-2.1 *)
 
 open Base
 open Ast
 open Typing
+module IntSet = Stdlib.Set.Make (Int)
 
 module R : sig
   type 'a t
@@ -28,7 +29,7 @@ module R : sig
   end
 
   val fresh : int t
-  val run : 'a t -> ('a, error) Result.t
+  val run : 'a t -> int -> ('a, error) Result.t
 end = struct
   type 'a t = int -> int * ('a, error) Result.t
 
@@ -65,7 +66,7 @@ end = struct
   end
 
   let fresh : int t = fun last -> last + 1, Result.Ok last
-  let run m = snd (m 0)
+  let run m x = snd (m x)
 end
 
 type fresh = int
@@ -129,7 +130,7 @@ end = struct
       | TVar n ->
         (match find_exn n s with
          | exception Not_found_s _ -> TVar n
-         | x -> x)
+         | x -> ehelper x)
       | TArr (left, right) -> arrow_t (ehelper left) (ehelper right)
       | ground -> ground
     in
@@ -138,7 +139,7 @@ end = struct
 
   let rec unify l r =
     match l, r with
-    | TGround l, TGround r when l == r -> return empty
+    | TGround l, TGround r when phys_equal l r -> return empty
     | TGround _, TGround _ -> fail @@ `UnificationFailed (l, r)
     | TVar a, TVar b when a = b -> return empty
     | TVar b, t | t, TVar b -> singleton b t
@@ -220,9 +221,28 @@ let fresh_var = fresh >>| var_t
 
 let instantiate : scheme -> typ R.t =
   fun (set, t) ->
+  let* st =
+    VarSet.fold
+      (fun st name ->
+        let res = IntSet.add name st in
+        return res)
+      (return IntSet.empty)
+      set
+  in
   VarSet.fold
     (fun typ name ->
-      let* f = fresh_var in
+      let* f =
+        let rec helper cnt =
+          let* tmp = fresh_var in
+          match tmp with
+          | TVar n ->
+            (match IntSet.find_opt n st with
+             | Some _ -> helper cnt
+             | _ -> return tmp)
+          | _ -> return tmp
+        in
+        helper 0
+      in
       let* s = Subst.singleton name f in
       return (Subst.apply s typ))
     (return t)
@@ -241,12 +261,6 @@ let lookup_env e map =
   | Some scheme ->
     let* ans = instantiate scheme in
     return (Subst.empty, ans, map)
-;;
-
-let rec get_name = function
-  | EApp (l, _) -> get_name l
-  | EVar name -> return name
-  | _ -> fail `Not_function
 ;;
 
 let infer =
@@ -307,7 +321,7 @@ let infer =
           let* identifier, exp =
             match elem with
             | _, PtVar id, exp -> return (id, exp)
-            | _ -> fail `Unreachable
+            | _, _, exp -> return ("_", exp)
           in
           let* fresh_var = fresh_var in
           let env' =
@@ -360,26 +374,43 @@ let infer =
   ehelper
 ;;
 
+let rec id_exists id = function
+  | EVar name -> String.equal id name
+  | EApp (p, e) -> id_exists id p || id_exists id e
+  | EUnOp (_, e) -> id_exists id e
+  | ELet (lst, exp) ->
+    id_exists id exp
+    || List.fold_left ~f:(fun acc (_, _, e) -> acc || id_exists id e) ~init:false lst
+  | EFun (_, e) -> id_exists id e
+  | EIf (e1, e2, e3) -> id_exists id e1 || id_exists id e2 || id_exists id e3
+  | EBinOp (_, e1, e2) -> id_exists id e1 || id_exists id e2
+  | EConst _ -> false
+;;
+
 let check_types environment (dec : decl) =
   match dec with
-  | DLet (false, PtVar name, exp) ->
-    let* subst, function_type, environment' = infer environment exp in
-    let res_typ = function_type in
-    let generalized_type = generalize environment' (Subst.apply subst res_typ) in
-    return (TypeEnv.extend environment' name generalized_type, res_typ)
-  | DLet (true, PtVar name, exp) ->
+  | DLet (true, PtVar name, exp) when id_exists name exp ->
     let* type_variable = fresh_var in
     let env =
       TypeEnv.extend environment name (Base.Set.empty (module Base.Int), type_variable)
     in
-    let* subst, typ', environment' = infer env exp in
-    let typ = typ' in
+    let* subst, typ, environment' = infer env exp in
     let* subst' = unify (Subst.apply subst type_variable) typ in
     let* final_subst = Subst.compose subst' subst in
     let env = TypeEnv.apply final_subst env in
-    let generalized_type = generalize env (Subst.apply final_subst type_variable) in
+    let typ = Subst.apply final_subst type_variable in
+    let generalized_type = generalize env typ in
     return (TypeEnv.extend environment' name generalized_type, typ)
-  | _ -> fail `Unreachable
+  | DLet (_, pt, exp) ->
+    let name =
+      match pt with
+      | PtVar id -> id
+      | _ -> "_"
+    in
+    let* subst, function_type, environment' = infer environment exp in
+    let res_typ = Subst.apply subst function_type in
+    let generalized_type = generalize environment' res_typ in
+    return (TypeEnv.extend environment' name generalized_type, res_typ)
 ;;
 
-let run_inference expression env = run (check_types env expression)
+let run_inference expression env x = run (check_types env expression) x
